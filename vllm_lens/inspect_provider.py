@@ -21,7 +21,7 @@ from vllm_lens._helpers._serialize import (
     decode_activation_entry,
     deserialize_hook_results,
 )
-from vllm_lens._helpers.types import Hook, SteeringVector
+from vllm_lens._helpers.types import HookSpec, SteeringVector
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +194,7 @@ class VLLMLensAPI(VLLMAPI):
                 extra_args["apply_steering_vectors"] = json.dumps(
                     [sv.model_dump() for sv in vectors]
                 )
-            hooks: list[Hook] | None = extra_args.get("apply_hooks")
+            hooks: list[HookSpec] | None = extra_args.get("apply_hooks")
             if hooks is not None:
                 if not copied:
                     extra_args = dict(extra_args)

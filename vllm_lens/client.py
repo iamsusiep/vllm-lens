@@ -41,7 +41,7 @@ from vllm_lens._helpers._serialize import (
     decode_activations,
     deserialize_hook_results,
 )
-from vllm_lens._helpers.types import Hook, SteeringVector
+from vllm_lens._helpers.types import HookSpec, SteeringVector
 
 
 @dataclass
@@ -97,7 +97,7 @@ class VLLMLensClient:
 
     def _build_xargs(
         self,
-        hooks: list[Hook] | None,
+        hooks: list[HookSpec] | None,
         capture_layers: list[int] | None,
         steering_vectors: list[SteeringVector] | None,
         activations_transport: str | None = None,
@@ -164,7 +164,7 @@ class VLLMLensClient:
         *,
         max_tokens: int = 16,
         temperature: float = 0.0,
-        hooks: list[Hook] | None = None,
+        hooks: list[HookSpec] | None = None,
         capture_layers: list[int] | None = None,
         capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
@@ -215,7 +215,7 @@ class VLLMLensClient:
         *,
         max_tokens: int = 16,
         temperature: float = 0.0,
-        hooks: list[Hook] | None = None,
+        hooks: list[HookSpec] | None = None,
         capture_layers: list[int] | None = None,
         capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
@@ -258,7 +258,7 @@ class VLLMLensClient:
 
     def register_hooks(
         self,
-        hooks: list[Hook],
+        hooks: list[HookSpec],
         prefetch_params: list[str] | None = None,
     ) -> None:
         """Register persistent hooks (appends to existing).

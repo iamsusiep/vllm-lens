@@ -6,16 +6,17 @@ annotation-based dependency injection.
 """
 
 import json
-import pickle
 from collections.abc import Iterator
-from typing import Any
 
 import cloudpickle
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from vllm_lens._helpers._serialize import serialize_hook_results
-from vllm_lens._helpers.types import Hook
+from vllm_lens._helpers._serialize import (
+    merge_persistent_hook_results,
+    serialize_hook_results,
+)
+from vllm_lens._helpers.types import parse_hook
 
 router = APIRouter(prefix="/v1/hooks", tags=["vllm-lens"])
 
@@ -91,7 +92,7 @@ async def register_hooks(raw_request: Request):
         not isinstance(h, dict) for h in hooks_raw
     ):
         raise HTTPException(400, "'hooks' must be a list of objects")
-    hooks = [Hook.model_validate(h) for h in hooks_raw]
+    hooks = [parse_hook(h) for h in hooks_raw]
     payload = cloudpickle.dumps(hooks)
     engine = _engine_client(raw_request)
     await engine.collective_rpc("set_persistent_hooks", args=(payload,))
@@ -105,28 +106,7 @@ async def register_hooks(raw_request: Request):
 @router.post("/collect")
 async def collect_hook_results(raw_request: Request):
     raw_list = await _engine_client(raw_request).collective_rpc("get_all_hook_results")
-    # Merge across PP ranks: each rank returns {req_id: {hook_idx: saved}}.
-    merged: dict[str, dict[str, dict[str, Any]]] = {}
-    for raw in raw_list or ():
-        if raw is None:
-            continue
-        rank_data: dict[str, dict[str, dict[str, Any]]] = pickle.loads(raw)
-        for req_id, hook_data in rank_data.items():
-            if req_id not in merged:
-                merged[req_id] = {}
-            for hook_idx, saved in hook_data.items():
-                if hook_idx not in merged[req_id]:
-                    merged[req_id][hook_idx] = {}
-                for key, val in saved.items():
-                    existing = merged[req_id][hook_idx]
-                    if (
-                        key in existing
-                        and isinstance(existing[key], list)
-                        and isinstance(val, list)
-                    ):
-                        existing[key].extend(val)
-                    else:
-                        existing[key] = val
+    merged = merge_persistent_hook_results(raw_list)
     serialized = {
         req_id: serialize_hook_results(hook_data)
         for req_id, hook_data in merged.items()

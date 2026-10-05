@@ -26,7 +26,14 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_lens._helpers._hook_output import _replace_hook_output
-from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
+from vllm_lens._helpers._linear_probe import run_batched_probes, save_probe_scores
+from vllm_lens._helpers.types import (
+    Hook,
+    HookContext,
+    HookSpec,
+    LinearProbe,
+    SteeringVector,
+)
 
 if TYPE_CHECKING:
     from jaxtyping import Float, Int
@@ -254,7 +261,7 @@ def _find_hook_configs(
     extension: HiddenStatesExtension,
     internal_req_id: str,
     extra_args: dict[str, Any] | None,
-) -> list[Hook]:
+) -> list[HookSpec]:
     """Find all hook definitions that apply to an internal request ID.
 
     Checks three sources (in order):
@@ -271,9 +278,9 @@ def _find_hook_configs_no_persistent(
     extension: HiddenStatesExtension,
     internal_req_id: str,
     extra_args: dict[str, Any] | None,
-) -> list[Hook]:
+) -> list[HookSpec]:
     """Find per-request hook definitions only (excludes persistent hooks)."""
-    results: list[Hook] = []
+    results: list[HookSpec] = []
     for external_id, hooks in extension._hook_data.items():
         if internal_req_id.startswith(f"{external_id}-"):
             results.extend(hooks)
@@ -464,7 +471,7 @@ def _hook_inner(
     # returned result index ("0", "1", ...) is stable regardless of how
     # many pre/post hooks a request mixes.  Pre-hooks are handled in
     # _pre_hook_inner using the same position keys.
-    per_req_hooks: list[list[Hook]] = []
+    per_req_hooks: list[list[HookSpec]] = []
     needs_hooks = False
     persistent_hooks = extension._persistent_hooks
     for i in range(num_reqs):
@@ -480,6 +487,45 @@ def _hook_inner(
         if hooks or persistent_hooks:
             needs_hooks = True
 
+    # Arbitrary callbacks retain their original request-major order. A bank
+    # can share a packed projection only when it cannot cross such a callback.
+    active_persistent = [
+        (pos, hook)
+        for pos, hook in enumerate(persistent_hooks)
+        if not hook.pre and hook.has_layer(layer_idx)
+    ]
+    batch_probes = [
+        (pos, hook) for pos, hook in active_persistent if isinstance(hook, LinearProbe)
+    ]
+    if (
+        batch_probes
+        and len(batch_probes) == len(active_persistent)
+        and not any(
+            not hook.pre and hook.has_layer(layer_idx)
+            for hooks in per_req_hooks
+            for hook in hooks
+        )
+    ):
+        if getattr(extension, "_should_capture", True):
+            probe_src = modified_output if modified_output is not None else output
+            if isinstance(probe_src, tuple):
+                probe_hidden = (
+                    probe_src[0] + probe_src[1]
+                    if probe_src[1] is not None
+                    else probe_src[0]
+                )
+            else:
+                probe_hidden = probe_src
+            run_batched_probes(
+                batch_probes,
+                layer_idx,
+                probe_hidden,
+                runner,
+                query_start_loc,
+                extension._persistent_hook_contexts,
+            )
+        needs_hooks = False
+
     if needs_hooks:
         # Compute hidden_states (summed if tuple) same as Phase 3 does.
         hook_src = modified_output if modified_output is not None else output
@@ -493,7 +539,7 @@ def _hook_inner(
         hook_hidden = hook_hidden.clone()
 
         def _run_post_category(
-            hooks: list[Hook],
+            hooks: list[HookSpec],
             store: dict[str, dict[int, HookContext]],
             req_id: str,
             start: int,
@@ -507,6 +553,10 @@ def _hook_inner(
             for pos, hook in enumerate(hooks):
                 if hook.pre or not hook.has_layer(layer_idx):
                     continue
+                if isinstance(hook, LinearProbe) and not getattr(
+                    extension, "_should_capture", True
+                ):
+                    continue
                 ctxs = store.setdefault(req_id, {})
                 ctx = ctxs.get(pos)
                 if ctx is None:
@@ -517,6 +567,9 @@ def _hook_inner(
                 ctx.model = runner.model
                 ctx._prefetched = extension._prefetched_params
 
+                if isinstance(hook, LinearProbe):
+                    save_probe_scores(hook, ctx, hook_hidden[start:end])
+                    continue
                 result = hook.fn(ctx, hook_hidden[start:end])
                 if result is not None:
                     modified_output = _replace_hook_output(
@@ -638,7 +691,7 @@ def _pre_hook_inner(
     working = input_tensor
 
     def _run_pre_category(
-        hooks: list[Hook],
+        hooks: list[HookSpec],
         store: dict[str, dict[int, HookContext]],
         req_id: str,
         start: int,
@@ -647,7 +700,11 @@ def _pre_hook_inner(
         """Run the pre-hooks in one category list at this layer."""
         nonlocal working, modified
         for pos, hook in enumerate(hooks):
-            if not hook.pre or not hook.has_layer(layer_idx):
+            if (
+                not isinstance(hook, Hook)
+                or not hook.pre
+                or not hook.has_layer(layer_idx)
+            ):
                 continue
             ctxs = store.setdefault(req_id, {})
             hctx = ctxs.get(pos)
@@ -931,10 +988,10 @@ class HiddenStatesExtension:
 
     # Per-request hook definitions:
     # key (external_req_id or _hook_id) → list of Hook
-    _hook_data: dict[str, list[Hook]] = {}
+    _hook_data: dict[str, list[HookSpec]] = {}
 
     # Persistent hooks (apply to every request, not auto-cleaned):
-    _persistent_hooks: list[Hook] = []
+    _persistent_hooks: list[HookSpec] = []
 
     # Per-request hook contexts, keyed by internal request ID then by the
     # hook's position in the per-request hook list:
@@ -1385,6 +1442,35 @@ class HiddenStatesExtension:
     # Hook data management (called via collective_rpc)
     # ------------------------------------------------------------------
 
+    def _prepare_hooks(self, pickled_data: bytes) -> list[HookSpec]:
+        """Validate registrations and retain worker-owned probe weights."""
+        hooks: list[HookSpec] = cloudpickle.loads(pickled_data)
+        num_layers = _get_total_num_layers(self)
+        prepared: list[HookSpec] = []
+        for hook in hooks:
+            for idx in hook.layer_indices:
+                if idx < 0 or idx >= num_layers:
+                    raise ValueError(
+                        f"layer_index {idx} out of range [0, {num_layers})"
+                    )
+            if isinstance(hook, LinearProbe):
+                hidden_size = self.model_config.get_hidden_size()
+                if hook.weights.shape[1] != hidden_size:
+                    raise ValueError(
+                        f"probe hidden_dim {hook.weights.shape[1]} does not match "
+                        f"model hidden_size {hidden_size}"
+                    )
+                device = (
+                    self.model_runner.device
+                    if self._should_capture
+                    else torch.device("cpu")
+                )
+                hook = hook.model_copy(
+                    update={"weights": hook.weights.to(device).clone()}
+                )
+            prepared.append(hook)
+        return prepared
+
     def set_hook_data(self, key: str, pickled_data: bytes) -> None:
         """Receive and store hook definitions for a request.
 
@@ -1393,15 +1479,7 @@ class HiddenStatesExtension:
         ``fn``), validates layer indices against the model, and stores them
         keyed by *key* (an external request ID or ``_hook_id`` sentinel).
         """
-        hooks: list[Hook] = cloudpickle.loads(pickled_data)
-        num_layers = _get_total_num_layers(self)
-        for hook in hooks:
-            for idx in hook.layer_indices:
-                if idx < 0 or idx >= num_layers:
-                    raise ValueError(
-                        f"layer_index {idx} out of range [0, {num_layers})"
-                    )
-        self._hook_data[key] = hooks
+        self._hook_data[key] = self._prepare_hooks(pickled_data)
 
     def get_hook_results(self, external_req_id: str) -> bytes | None:
         """Retrieve hook results (``ctx.saved`` dicts) for a request.
@@ -1441,21 +1519,13 @@ class HiddenStatesExtension:
     def set_persistent_hooks(self, pickled_data: bytes) -> None:
         """Append hooks that apply to every subsequent request.
 
-        Accepts cloudpickle'd ``list[Hook]``.  Validates layer indices.
+        Accepts cloudpickle'd ``list[HookSpec]``.  Validates layer indices.
         Appends to existing persistent hooks (call ``clear_persistent_hooks``
         first for a clean slate).  Also ensures forward hooks are installed
         on the model layers.
         """
         self.install_hooks()
-        hooks: list[Hook] = cloudpickle.loads(pickled_data)
-        num_layers = _get_total_num_layers(self)
-        for hook in hooks:
-            for idx in hook.layer_indices:
-                if idx < 0 or idx >= num_layers:
-                    raise ValueError(
-                        f"layer_index {idx} out of range [0, {num_layers})"
-                    )
-        self._persistent_hooks.extend(hooks)
+        self._persistent_hooks.extend(self._prepare_hooks(pickled_data))
 
     def get_all_hook_results(self) -> bytes | None:
         """Retrieve accumulated persistent hook contexts from all requests.

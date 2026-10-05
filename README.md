@@ -263,6 +263,43 @@ POST /v1/hooks/clear_prefetched
 
 Multiple `register` calls append hooks. `collect` is non-destructive, so results accumulate across requests; `clear_results` (`client.clear_hook_results()`) drains them while keeping the hooks registered, and `clear` removes hooks and all accumulated results. Pre-fetched parameters persist independently.
 
+### Batched linear probes
+
+Use `LinearProbe` for a shared, read-only bank of linear projections. Register
+it through the same persistent hook API, either offline (`llm`) or over HTTP
+(`client`):
+
+```python
+import torch
+from vllm_lens import LinearProbe
+
+# trained_weights: floating-point tensor (n_probes, model_hidden_dim)
+probe = LinearProbe(weights=trained_weights, layer_indices=[15])
+client.register_hooks([probe])
+client.generate("Hello", max_tokens=10)
+results = client.collect_hook_results()
+for request_hooks in results.values():
+    scores = torch.cat(request_hooks["0"]["L15"], dim=0)
+    print(scores.shape)  # (processed_tokens, n_probes), CPU FP32
+client.clear_hooks()
+```
+
+Weights are snapshotted as CPU FP32 and uploaded once to the capturing worker.
+When the active persistent post-hooks are all probes and there are no active
+per-request post-hooks, each bank uses one packed projection and one reduced
+score transfer for the scheduler batch. Mixing arbitrary callbacks retains the
+usual request order and evaluates probes per request, so a probe after a
+modifying hook sees its changes. Steering always precedes probes. Probes read
+the full fused residual stream and never modify it; only TP rank 0 saves scores.
+Offline collection merges one TP replica per PP stage.
+
+Results use the original hook-list index. Each `L<layer>` value is a list of
+`(chunk_tokens, n_probes)` tensors in forward-pass order for that request and
+layer, including chunked prefill and decode. Rows describe processed tokens,
+without trimming to emitted tokens. `clear_hook_results()` retains weights;
+`clear_hooks()` releases them. Batching requires an FP32 copy of the packed
+hidden states, so it can use more temporary GPU memory than per-request hooks.
+
 ### Accessing model parameters from hooks
 
 Hooks can access model parameters (e.g. `lm_head.weight` for logit lens) via `ctx.get_parameter()`. This auto-gathers across TP ranks:

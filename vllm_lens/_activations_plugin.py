@@ -25,11 +25,12 @@ import torch
 import zstandard as zstd
 
 from vllm_lens._helpers._serialize import (
+    merge_persistent_hook_results,
     serialize_activations,
     serialize_activations_binary,
     serialize_hook_results,
 )
-from vllm_lens._helpers.types import Hook, SteeringVector
+from vllm_lens._helpers.types import HookSpec, SteeringVector, parse_hook
 
 logger = logging.getLogger(__name__)
 
@@ -275,7 +276,7 @@ def _decode_steering_vectors(value: Any) -> list[SteeringVector] | None:
     ]
 
 
-def _decode_hooks(value: Any) -> list[Hook] | None:
+def _decode_hooks(value: Any) -> list[HookSpec] | None:
     """Normalise an ``apply_hooks`` extra_args value.
 
     Same forms as :func:`_decode_steering_vectors`, for ``Hook``.
@@ -284,7 +285,7 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
         return None
     if isinstance(value, str):
         value = json.loads(value)
-    return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
+    return [parse_hook(h) for h in value]
 
 
 def _trim_activations(
@@ -899,12 +900,12 @@ def _llm_register_hooks(
 
 
 def _llm_collect_hook_results(self: LLM) -> dict:
-    """Collect all accumulated hook results from the worker."""
+    """Collect persistent results from one TP replica per PP stage."""
     raw_list = self.collective_rpc("get_all_hook_results")
-    for raw in raw_list or ():
-        if raw is not None:
-            return pickle.loads(raw)
-    return {}
+    tp_size = self.llm_engine.vllm_config.parallel_config.tensor_parallel_size
+    # Residual streams are replicated across TP ranks. Keep the offline
+    # API's single-replica behavior while collecting every PP stage.
+    return merge_persistent_hook_results(raw_list[::tp_size] if raw_list else None)
 
 
 def _llm_clear_hooks(self: LLM) -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
-from typing import Any, Self
+from typing import Any, Literal, Self, cast
 
 import cloudpickle
 import torch
@@ -240,3 +240,67 @@ class Hook(BaseModel):
     def has_layer(self, layer_idx: int) -> bool:
         """O(1) layer membership test (uses cached frozenset)."""
         return layer_idx in self._layer_set  # type: ignore[reportAttributeAccessIssue]
+
+
+class LinearProbe(BaseModel):
+    """Read-only FP32 projections of each token's post-layer residual stream.
+
+    Register with ``register_hooks([probe])`` to share one probe bank across
+    requests. Results use the hook's list position and ``L<layer_index>`` keys;
+    each value is a list of CPU tensors shaped ``(chunk_tokens, n_probes)``.
+    Chunk lists retain forward-pass order, including chunked prefill/decode.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    kind: Literal["linear_probe"] = "linear_probe"
+    weights: torch.Tensor
+    """Rows of the probe bank, shaped ``(n_probes, hidden_dim)``.
+
+    Construction snapshots floating-point weights as detached CPU FP32.
+    Register a new probe to change weights; workers retain their own copy.
+    """
+    layer_indices: list[int]
+    pre: Literal[False] = False
+
+    @field_validator("weights", mode="before")
+    @classmethod
+    def _deserialize_weights(cls, value: Any) -> torch.Tensor:
+        if isinstance(value, dict) and "data" in value:
+            value = deserialize_tensor(value)
+        if not isinstance(value, torch.Tensor):
+            raise ValueError("weights must be a floating-point tensor or tensor dict")
+        tensor = cast(torch.Tensor, value)
+        if not tensor.is_floating_point():
+            raise ValueError("weights must be floating-point")
+        if tensor.ndim != 2 or min(tensor.shape) == 0:
+            raise ValueError(
+                "weights must have shape (n_probes, hidden_dim), both nonzero"
+            )
+        return tensor.detach().to(device="cpu", dtype=torch.float32).clone()
+
+    @field_serializer("weights")
+    def _serialize_weights(self, value: torch.Tensor, _info: Any) -> dict[str, Any]:
+        return serialize_tensor(value)
+
+    @model_validator(mode="after")
+    def _check_layers(self) -> Self:
+        if not self.layer_indices:
+            raise ValueError("layer_indices must be non-empty")
+        object.__setattr__(self, "_layer_set", frozenset(self.layer_indices))
+        return self
+
+    def has_layer(self, layer_idx: int) -> bool:
+        return layer_idx in self._layer_set  # type: ignore[reportAttributeAccessIssue]
+
+
+HookSpec = Hook | LinearProbe
+
+
+def parse_hook(value: Any) -> HookSpec:
+    """Preserve typed probes through the existing hook JSON transport."""
+    if isinstance(value, (Hook, LinearProbe)):
+        return value
+    if isinstance(value, dict) and value.get("kind") == "linear_probe":
+        return LinearProbe.model_validate(value)
+    return Hook.model_validate(value)

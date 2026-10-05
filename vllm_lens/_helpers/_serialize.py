@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import pickle
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,31 @@ _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
 _TORCH_TO_NUMPY_VIEW: dict[torch.dtype, np.dtype[Any]] = {
     torch.bfloat16: np.dtype(np.int16),
 }
+
+
+def merge_persistent_hook_results(
+    raw_list: list[bytes | None] | None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Merge persistent results across PP stages, for offline and HTTP callers."""
+    merged: dict[str, dict[str, dict[str, Any]]] = {}
+    for raw in raw_list or ():
+        if raw is None:
+            continue
+        rank_data: dict[str, dict[str, dict[str, Any]]] = pickle.loads(raw)
+        for req_id, hook_data in rank_data.items():
+            request = merged.setdefault(req_id, {})
+            for hook_idx, saved in hook_data.items():
+                existing = request.setdefault(hook_idx, {})
+                for key, value in saved.items():
+                    if (
+                        key in existing
+                        and isinstance(existing[key], list)
+                        and isinstance(value, list)
+                    ):
+                        existing[key].extend(value)
+                    else:
+                        existing[key] = value
+    return merged
 
 
 def _encode_tensor(tensor: torch.Tensor) -> tuple[bytes, dict[str, Any]]:
