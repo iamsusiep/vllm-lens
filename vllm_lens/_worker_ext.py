@@ -465,8 +465,12 @@ def _hook_inner(
     # many pre/post hooks a request mixes.  Pre-hooks are handled in
     # _pre_hook_inner using the same position keys.
     per_req_hooks: list[list[Hook]] = []
+    per_req_active: list[bool] = []
     needs_hooks = False
     persistent_hooks = extension._persistent_hooks
+    persistent_active = any(
+        not hook.pre and hook.has_layer(layer_idx) for hook in persistent_hooks
+    )
     for i in range(num_reqs):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
@@ -477,7 +481,9 @@ def _hook_inner(
         )
         hooks = _find_hook_configs_no_persistent(extension, req_id, extra)
         per_req_hooks.append(hooks)
-        if hooks or persistent_hooks:
+        active = any(not hook.pre and hook.has_layer(layer_idx) for hook in hooks)
+        per_req_active.append(active)
+        if active or persistent_active:
             needs_hooks = True
 
     if needs_hooks:
@@ -524,7 +530,7 @@ def _hook_inner(
                     )
 
         for i in range(num_reqs):
-            if not (persistent_hooks or per_req_hooks[i]):
+            if not (persistent_active or per_req_active[i]):
                 continue
             req_id = req_ids[i]
             start = int(query_start_loc[i].item())
@@ -634,6 +640,9 @@ def _pre_hook_inner(
     # either pre or post (never both), so pre and post never collide on the
     # same key — this is what lets a request mix pre- and post-hooks safely.
     persistent_hooks = extension._persistent_hooks
+    persistent_active = any(
+        hook.pre and hook.has_layer(layer_idx) for hook in persistent_hooks
+    )
     modified = False
     working = input_tensor
 
@@ -675,7 +684,9 @@ def _pre_hook_inner(
             else None
         )
         per_req = _find_hook_configs_no_persistent(extension, req_id, extra)
-        if not any(h.pre for h in persistent_hooks) and not any(h.pre for h in per_req):
+        if not persistent_active and not any(
+            hook.pre and hook.has_layer(layer_idx) for hook in per_req
+        ):
             continue
 
         start = int(query_start_loc[i].item())
