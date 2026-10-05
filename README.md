@@ -296,7 +296,7 @@ Offline collection merges one TP replica per PP stage.
 Results use the original hook-list index. Each `L<layer>` value is a list of
 `(chunk_tokens, n_probes)` tensors in forward-pass order for that request and
 layer, including chunked prefill and decode. Rows describe processed tokens,
-without trimming to emitted tokens. `clear_hook_results()` retains weights;
+without trimming to emitted tokens. `client.clear_hook_results()` retains weights;
 `clear_hooks()` releases them. Batching requires an FP32 copy of the packed
 hidden states, so it can use more temporary GPU memory than per-request hooks.
 
