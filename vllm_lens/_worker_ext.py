@@ -465,12 +465,12 @@ def _hook_inner(
     # many pre/post hooks a request mixes.  Pre-hooks are handled in
     # _pre_hook_inner using the same position keys.
     per_req_hooks: list[list[Hook]] = []
-    per_req_active: list[bool] = []
     needs_hooks = False
     persistent_hooks = extension._persistent_hooks
     persistent_active = any(
         not hook.pre and hook.has_layer(layer_idx) for hook in persistent_hooks
     )
+    per_req_active: list[bool] = []
     for i in range(num_reqs):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
