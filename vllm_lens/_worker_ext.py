@@ -516,15 +516,28 @@ def _hook_inner(
                 )
             else:
                 probe_hidden = probe_src
-            run_batched_probes(
-                batch_probes,
-                layer_idx,
-                probe_hidden,
-                runner,
-                query_start_loc,
-                extension._persistent_hook_contexts,
-            )
-        needs_hooks = False
+            try:
+                run_batched_probes(
+                    batch_probes,
+                    layer_idx,
+                    probe_hidden,
+                    runner,
+                    query_start_loc,
+                    extension._persistent_hook_contexts,
+                )
+            except ValueError as error:
+                # Boundary validation happens before saving scores. Retry with
+                # attention metadata without discarding steering or capture.
+                logger.warning(
+                    "Invalid batched probe boundaries on layer %d, "
+                    "falling back to per-request probes: %s",
+                    layer_idx,
+                    error,
+                )
+            else:
+                needs_hooks = False
+        else:
+            needs_hooks = False
 
     if needs_hooks:
         # Compute hidden_states (summed if tuple) same as Phase 3 does.

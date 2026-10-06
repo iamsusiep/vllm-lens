@@ -249,6 +249,37 @@ def test_non_capture_rank_skips_probes_but_runs_mutating_callbacks(worker, monke
     )
 
 
+@pytest.mark.parametrize("fused", [False, True])
+def test_invalid_cpu_boundaries_preserve_steering_and_capture(
+    worker, monkeypatch, fused, caplog
+):
+    probe = LinearProbe(weights=torch.eye(3), layer_indices=[3])
+    extension = make_extension(worker, monkeypatch, persistent=[probe])
+    # The attention tensor remains valid; only its CPU mirror is inconsistent.
+    extension.model_runner.query_start_loc.cpu = torch.tensor([0, 3, 2])
+    extension._steering_data["r0"] = [
+        SteeringVector(activations=torch.ones(1, 3), layer_indices=[3])
+    ]
+    for request in extension.model_runner.requests.values():
+        request.sampling_params.extra_args = {"output_residual_stream": [3]}
+    hidden = torch.arange(9).reshape(3, 3).float()
+    output = (hidden, torch.ones_like(hidden)) if fused else hidden
+    expected = hidden + 1 if fused else hidden.clone()
+    expected[:2] += 1
+    result = worker._make_hook(extension, 3)(torch.nn.Identity(), (), output)
+    assert result is not None
+    stream = result[0] + result[1] if fused else result
+    torch.testing.assert_close(stream, expected)
+    for req_id, sl in [("r0-internal", slice(0, 2)), ("r1-internal", slice(2, 3))]:
+        scores = extension._persistent_hook_contexts[req_id][0].saved["L3"]
+        assert len(scores) == 1
+        torch.testing.assert_close(scores[0], expected[sl])
+        torch.testing.assert_close(
+            extension._captured_states[req_id][3][0], expected[sl]
+        )
+    assert "falling back to per-request probes" in caplog.text
+
+
 def test_boundary_fallback_transfers_once_and_skips_empty_requests(monkeypatch):
     probe = LinearProbe(weights=torch.eye(3), layer_indices=[3])
     runner = SimpleNamespace(
