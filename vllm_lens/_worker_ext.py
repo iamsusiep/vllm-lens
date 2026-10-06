@@ -987,7 +987,7 @@ class HiddenStatesExtension:
     _steering_data: dict[str, list[SteeringVector]] = {}
 
     # Per-request hook definitions:
-    # key (external_req_id or _hook_id) → list of Hook
+    # key (external_req_id or _hook_id) → list of HookSpec
     _hook_data: dict[str, list[HookSpec]] = {}
 
     # Persistent hooks (apply to every request, not auto-cleaned):
@@ -1475,8 +1475,8 @@ class HiddenStatesExtension:
         """Receive and store hook definitions for a request.
 
         Called via ``collective_rpc`` before generation begins.  Unpickles
-        the list of ``Hook`` instances (using cloudpickle for the callable
-        ``fn``), validates layer indices against the model, and stores them
+        the list of hooks or probes (using cloudpickle for hook callables),
+        validates layer indices against the model, and stores them
         keyed by *key* (an external request ID or ``_hook_id`` sentinel).
         """
         self._hook_data[key] = self._prepare_hooks(pickled_data)

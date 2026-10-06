@@ -32,6 +32,7 @@ Usage::
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -97,7 +98,7 @@ class VLLMLensClient:
 
     def _build_xargs(
         self,
-        hooks: list[HookSpec] | None,
+        hooks: Sequence[HookSpec] | None,
         capture_layers: list[int] | None,
         steering_vectors: list[SteeringVector] | None,
         activations_transport: str | None = None,
@@ -164,7 +165,7 @@ class VLLMLensClient:
         *,
         max_tokens: int = 16,
         temperature: float = 0.0,
-        hooks: list[HookSpec] | None = None,
+        hooks: Sequence[HookSpec] | None = None,
         capture_layers: list[int] | None = None,
         capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
@@ -215,7 +216,7 @@ class VLLMLensClient:
         *,
         max_tokens: int = 16,
         temperature: float = 0.0,
-        hooks: list[HookSpec] | None = None,
+        hooks: Sequence[HookSpec] | None = None,
         capture_layers: list[int] | None = None,
         capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
@@ -258,13 +259,13 @@ class VLLMLensClient:
 
     def register_hooks(
         self,
-        hooks: list[HookSpec],
+        hooks: Sequence[HookSpec],
         prefetch_params: list[str] | None = None,
     ) -> None:
         """Register persistent hooks (appends to existing).
 
         Args:
-            hooks: Hooks to register.
+            hooks: Generic hooks or read-only probes to register.
             prefetch_params: Parameter names to pre-fetch across all ranks
                 (TP + PP).  Needed for ``ctx.get_parameter()`` with PP.
         """

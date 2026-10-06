@@ -1,4 +1,4 @@
-"""Pydantic models for vllm-lens steering vectors and hooks."""
+"""Pydantic models for vllm-lens steering vectors, hooks, and probes."""
 
 from __future__ import annotations
 
@@ -254,6 +254,7 @@ class LinearProbe(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     kind: Literal["linear_probe"] = "linear_probe"
+    """Discriminator for the existing hook JSON transport."""
     weights: torch.Tensor
     """Rows of the probe bank, shaped ``(n_probes, hidden_dim)``.
 
@@ -261,7 +262,9 @@ class LinearProbe(BaseModel):
     Register a new probe to change weights; workers retain their own copy.
     """
     layer_indices: list[int]
+    """Decoder-layer outputs to project, using the same bank at each layer."""
     pre: Literal[False] = False
+    """Probes observe layer outputs; the shared dispatcher uses this flag."""
 
     @field_validator("weights", mode="before")
     @classmethod

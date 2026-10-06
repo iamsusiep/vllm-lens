@@ -80,7 +80,7 @@
     ]
 
 [tool.pyright]
-    include=["vllm_lens"]
+    include=["vllm_lens", "tests/typechecks"]
     exclude=["vllm_lens/tests"]
     reportMissingImports=false
     reportMissingModuleSource=false

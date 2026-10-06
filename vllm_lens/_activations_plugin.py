@@ -279,7 +279,7 @@ def _decode_steering_vectors(value: Any) -> list[SteeringVector] | None:
 def _decode_hooks(value: Any) -> list[HookSpec] | None:
     """Normalise an ``apply_hooks`` extra_args value.
 
-    Same forms as :func:`_decode_steering_vectors`, for ``Hook``.
+    Same forms as :func:`_decode_steering_vectors`, for hooks and linear probes.
     """
     if value is None:
         return None
