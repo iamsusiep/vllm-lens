@@ -467,6 +467,7 @@ def _hook_inner(
     per_req_hooks: list[list[Hook]] = []
     needs_hooks = False
     persistent_hooks = extension._persistent_hooks
+    # Check eligibility before cloning or synchronizing CUDA request boundaries.
     persistent_active = any(
         not hook.pre and hook.has_layer(layer_idx) for hook in persistent_hooks
     )
@@ -640,6 +641,7 @@ def _pre_hook_inner(
     # either pre or post (never both), so pre and post never collide on the
     # same key — this is what lets a request mix pre- and post-hooks safely.
     persistent_hooks = extension._persistent_hooks
+    # Inactive pre-hooks do not need scalar reads of CUDA request boundaries.
     persistent_active = any(
         hook.pre and hook.has_layer(layer_idx) for hook in persistent_hooks
     )
