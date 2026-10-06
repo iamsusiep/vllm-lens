@@ -636,7 +636,12 @@ def _hook_inner(
             )
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
-    if getattr(extension, "_should_capture", True):
+    capturing = [
+        i
+        for i, layers in enumerate(plan.capture)
+        if layers is True or (isinstance(layers, frozenset) and layer_idx in layers)
+    ]
+    if capturing and getattr(extension, "_should_capture", True):
         capture_src = modified_output if modified_output is not None else output
         hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"]  # type: ignore[reportUndefinedVariable]
         if isinstance(capture_src, tuple):
@@ -647,17 +652,27 @@ def _hook_inner(
         else:
             hidden_states = capture_src
 
-        for i in range(num_reqs):
-            layers = plan.capture[i]
-            if layers is None or (
-                isinstance(layers, frozenset) and layer_idx not in layers
-            ):
-                continue
+        # One blocking device-to-host copy for every capturing request at
+        # this layer, instead of one per request.
+        spans = [plan.span(i) for i in capturing]
+        if all(prev[1] == nxt[0] for prev, nxt in zip(spans, spans[1:])):
+            rows = hidden_states[spans[0][0] : spans[-1][1]]
+        else:
+            rows = torch.cat([hidden_states[start:end] for start, end in spans])
+        host_rows = rows.cpu()
+
+        offset = 0
+        for i, (start, end) in zip(capturing, spans):
             req_id = req_ids[i]
-            start, end = plan.span(i)
-            activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
-                start:end
-            ].cpu()
+            n_tokens = end - start
+            activation: Float[torch.Tensor, "seq_len hidden_dim"] = host_rows[  # type: ignore[reportUndefinedVariable]
+                offset : offset + n_tokens
+            ]
+            offset += n_tokens
+            if len(spans) > 1:
+                # Own the storage, so one request's results do not keep the
+                # whole batch's copy alive.
+                activation = activation.clone()
 
             if req_id not in extension._captured_states:
                 extension._captured_states[req_id] = {}
