@@ -279,3 +279,72 @@ def test_steering_for_other_layers_skips_clone_and_boundaries(worker, monkeypatc
 def test_capture_layers_parsing(worker, value, expected):
     extra = {} if value is None else {"output_residual_stream": value}
     assert worker._capture_layers(extra) == expected
+
+
+def count_cpu_copies(monkeypatch):
+    copies = []
+    cpu = torch.Tensor.cpu
+
+    def counted(tensor, *args, **kwargs):
+        copies.append(tensor.shape[0])
+        return cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", counted)
+    return copies
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize(
+    "requested,expected_rows",
+    # Adjacent capturing requests share one slice; gaps are gathered first.
+    [((True, True, True), 6), ((True, None, "[0]"), 5), ((None, "[0]", None), 1)],
+)
+def test_capture_copies_each_layer_once(
+    worker, monkeypatch, fused, requested, expected_rows
+):
+    starts = QueryStarts([0, 2, 3, 6])
+    extension = make_extension(worker, monkeypatch, starts, per_request=[[], [], []])
+    for i, value in enumerate(requested):
+        if value is not None:
+            extension.model_runner.requests[
+                f"r{i}-internal"
+            ].sampling_params.extra_args = {"output_residual_stream": value}
+    hidden = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    output = (hidden, torch.full_like(hidden, 100)) if fused else hidden
+    stream = hidden + 100 if fused else hidden
+    copies = count_cpu_copies(monkeypatch)
+
+    assert worker._hook_inner(extension, 0, output) is None
+    assert copies == [expected_rows]
+
+    spans = [(0, 2), (2, 3), (3, 6)]
+    captured = extension._captured_states
+    assert set(captured) == {f"r{i}-internal" for i, v in enumerate(requested) if v}
+    pointers = set()
+    for i, (start, end) in enumerate(spans):
+        if requested[i] is None:
+            continue
+        (activation,) = captured[f"r{i}-internal"][0]
+        torch.testing.assert_close(activation, stream[start:end])
+        pointers.add(activation.untyped_storage().data_ptr())
+        if len(set(captured)) > 1:
+            # Split results own their rows. (A lone result is the copy
+            # itself on GPU; on CPU, .cpu() returns the input unchanged.)
+            assert activation.untyped_storage().nbytes() == activation.nbytes
+    assert len(pointers) == len(set(captured))
+
+
+def test_no_capture_at_layer_skips_stream_sum_and_copy(worker, monkeypatch):
+    starts = QueryStarts([0, 2], allowed=False)
+    extension = make_extension(worker, monkeypatch, starts)
+    extension.model_runner.requests["r0-internal"].sampling_params.extra_args = {
+        "output_residual_stream": [5]
+    }
+    hidden = torch.ones(2, 2)
+    copies = count_cpu_copies(monkeypatch)
+    monkeypatch.setattr(
+        torch.Tensor, "__add__", lambda *_: pytest.fail("Summed unused stream")
+    )
+    assert worker._hook_inner(extension, 3, (hidden, hidden)) is None
+    assert copies == []
+    assert extension._captured_states == {}
