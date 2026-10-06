@@ -1070,10 +1070,13 @@ class HiddenStatesExtension:
             )
 
         self._steering_data[key] = vectors
+        self._step_plan = None
 
     def clear_steering_data(self, key: str) -> None:
         """Remove steering data for a completed request."""
         self._steering_data.pop(key, None)
+        # Release the plan's references to completed request payloads.
+        self._step_plan = None
 
     def clear_captured_states(self, external_req_id: str) -> None:
         """Remove captured activations without returning them.
@@ -1439,6 +1442,7 @@ class HiddenStatesExtension:
                         f"layer_index {idx} out of range [0, {num_layers})"
                     )
         self._hook_data[key] = hooks
+        self._step_plan = None
 
     def get_hook_results(self, external_req_id: str) -> bytes | None:
         """Retrieve hook results (``ctx.saved`` dicts) for a request.
@@ -1460,6 +1464,7 @@ class HiddenStatesExtension:
     def clear_hook_data(self, key: str) -> None:
         """Remove hook definitions for a completed request."""
         self._hook_data.pop(key, None)
+        self._step_plan = None
 
     def clear_hook_contexts(self, external_req_id: str) -> None:
         """Remove hook contexts for a completed or aborted request.

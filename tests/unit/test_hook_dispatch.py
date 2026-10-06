@@ -1,12 +1,15 @@
 """Generic hook eligibility and dispatch without vLLM or a GPU."""
 
 import importlib.util
+import pickle
 import sys
+import weakref
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+import cloudpickle
 
 from vllm_lens import Hook, SteeringVector
 
@@ -160,6 +163,48 @@ def test_plan_tracks_joining_finishing_and_reordered_requests(worker, monkeypatc
         )
         assert locations.reads == 1
         previous_plan = plan
+
+
+@pytest.mark.parametrize("kind", ["steering", "hook"])
+@pytest.mark.parametrize("operation", ["clear", "replace"])
+def test_request_updates_release_cached_payload(worker, monkeypatch, kind, operation):
+    extension = make_extension(worker, monkeypatch, QueryStarts([0, 2]))
+    payload = torch.ones(1, 2)
+    reference = weakref.ref(payload)
+    if kind == "steering":
+        extension._steering_data["r0"] = [
+            SteeringVector(activations=payload, layer_indices=[3])
+        ]
+        cleanup = worker.HiddenStatesExtension.clear_steering_data
+    else:
+        extension._hook_data["r0"] = [
+            Hook(fn=lambda _, h, vector=payload: h + vector, layer_indices=[3])
+        ]
+        cleanup = worker.HiddenStatesExtension.clear_hook_data
+    del payload
+    assert worker._get_step_plan(extension) is not None
+    assert reference() is not None
+
+    if operation == "clear":
+        cleanup(extension, "r0")
+    else:
+        monkeypatch.setattr(worker, "_get_total_num_layers", lambda _: 4)
+        extension.model_runner.model = torch.nn.Linear(2, 2)
+        if kind == "steering":
+            replacement = SteeringVector(
+                activations=torch.zeros(1, 2), layer_indices=[3]
+            )
+            worker.HiddenStatesExtension.set_steering_data(
+                extension, "r0", pickle.dumps([replacement])
+            )
+        else:
+            replacement = Hook(fn=lambda *_: None, layer_indices=[3])
+            worker.HiddenStatesExtension.set_hook_data(
+                extension, "r0", cloudpickle.dumps([replacement])
+            )
+
+    assert extension._step_plan is None
+    assert reference() is None
 
 
 def test_steering_for_other_layers_skips_clone_and_boundaries(worker, monkeypatch):
