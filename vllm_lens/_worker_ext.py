@@ -17,6 +17,7 @@ import logging
 import os
 import pickle
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import cloudpickle
@@ -364,12 +365,58 @@ def _apply_steering(
                 target[rel] = target[rel] + v * cfg.scale
 
 
-def _hook_inner(
-    extension: HiddenStatesExtension,
-    layer_idx: int,
-    output: torch.Tensor | tuple[torch.Tensor, ...],
-) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
-    """Core hook logic, separated so _make_hook can wrap it in try/except."""
+@dataclass
+class _StepPlan:
+    """Per-request lookups shared by every hooked layer of one forward pass.
+
+    Registrations and request state only change between scheduler steps, so
+    the first hooked layer resolves them and later layers reuse the result.
+    """
+
+    forward_context: Any
+    attn_metadata: Any
+    query_start_loc: torch.Tensor
+    req_ids: list[str]
+    steering: list[list[SteeringVector]]
+    hooks: list[list[Hook]]
+    # Layers each request's own hooks target, split by pre/post.
+    pre_layers: list[frozenset[int]]
+    post_layers: list[frozenset[int]]
+    # None: no capture; True: every layer; otherwise the requested layers.
+    capture: list[frozenset[int] | bool | None]
+    _boundaries: list[int] | None = None
+
+    def span(self, i: int) -> tuple[int, int]:
+        """Token range of request ``i`` in the packed batch."""
+        boundaries = self._boundaries
+        if boundaries is None:
+            # One device-to-host read per step, instead of two scalar
+            # reads (each a CUDA sync) per request per layer.
+            boundaries = self.query_start_loc[: len(self.req_ids) + 1].tolist()
+            self._boundaries = boundaries
+        return boundaries[i], boundaries[i + 1]
+
+
+def _capture_layers(extra: dict[str, Any] | None) -> frozenset[int] | bool | None:
+    """Parse ``output_residual_stream`` from a request's extra_args."""
+    if not extra:
+        return None
+    output_residual_stream = extra.get("output_residual_stream")
+    if output_residual_stream is None:
+        return None
+    # vllm_xargs passes values as strings; parse JSON lists.
+    if isinstance(output_residual_stream, str):
+        try:
+            output_residual_stream = json.loads(output_residual_stream)
+        except (json.JSONDecodeError, ValueError):
+            pass  # treat as truthy (capture all layers)
+    if isinstance(output_residual_stream, list):
+        return frozenset(output_residual_stream)
+    return True
+
+
+def _get_step_plan(extension: HiddenStatesExtension) -> _StepPlan | None:
+    """Return this forward pass's plan, building it on the first layer."""
     if not is_forward_context_available():
         return None
 
@@ -377,8 +424,6 @@ def _hook_inner(
     num_reqs = runner.input_batch.num_reqs
     if num_reqs == 0:
         return None
-
-    req_ids = runner.input_batch.req_ids
 
     ctx = get_forward_context()
     attn_metadata = ctx.attn_metadata
@@ -388,6 +433,17 @@ def _hook_inner(
         attn_metadata = attn_metadata[0]
         if attn_metadata is None:
             return None
+
+    # vLLM builds a new forward context and metadata for every forward pass.
+    plan: _StepPlan | None = getattr(extension, "_step_plan", None)
+    if (
+        plan is not None
+        and plan.forward_context is ctx
+        and plan.attn_metadata is attn_metadata
+        and len(plan.req_ids) == num_reqs
+    ):
+        return plan
+
     # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
     # attention metadata entries — some (like GDNAttentionMetadata) lack
     # query_start_loc.  Find one that has it.
@@ -399,26 +455,72 @@ def _hook_inner(
     if query_start_loc is None:
         logger.warning(
             "No attention metadata with query_start_loc found "
-            "(keys: %s). Skipping hook for this step.",
+            "(keys: %s). Skipping hooks for this step.",
             list(attn_metadata.keys()),
         )
         return None
 
-    # --- Phase 1: detect steering requests --------------------------
-    per_req_steering: list[list[SteeringVector]] = []
-    needs_steering = False
-    for i in range(num_reqs):
-        req_id = req_ids[i]
+    req_ids = list(runner.input_batch.req_ids[:num_reqs])
+    steering: list[list[SteeringVector]] = []
+    hooks: list[list[Hook]] = []
+    pre_layers: list[frozenset[int]] = []
+    post_layers: list[frozenset[int]] = []
+    capture: list[frozenset[int] | bool | None] = []
+    for req_id in req_ids:
         req_state = runner.requests.get(req_id)
         extra = (
             req_state.sampling_params.extra_args
             if req_state and req_state.sampling_params
             else None
         )
-        configs = _find_steering_configs(extension, req_id, extra)
-        per_req_steering.append(configs)
-        if configs:
-            needs_steering = True
+        steering.append(_find_steering_configs(extension, req_id, extra))
+        req_hooks = _find_hook_configs_no_persistent(extension, req_id, extra)
+        hooks.append(req_hooks)
+        pre_layers.append(
+            frozenset(i for h in req_hooks if h.pre for i in h.layer_indices)
+        )
+        post_layers.append(
+            frozenset(i for h in req_hooks if not h.pre for i in h.layer_indices)
+        )
+        capture.append(_capture_layers(extra))
+
+    plan = _StepPlan(
+        forward_context=ctx,
+        attn_metadata=attn_metadata,
+        query_start_loc=query_start_loc,
+        req_ids=req_ids,
+        steering=steering,
+        hooks=hooks,
+        pre_layers=pre_layers,
+        post_layers=post_layers,
+        capture=capture,
+    )
+    extension._step_plan = plan
+    return plan
+
+
+def _hook_inner(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    output: torch.Tensor | tuple[torch.Tensor, ...],
+) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
+    """Core hook logic, separated so _make_hook can wrap it in try/except."""
+    plan = _get_step_plan(extension)
+    if plan is None:
+        return None
+
+    runner = extension.model_runner
+    num_reqs = len(plan.req_ids)
+    req_ids = plan.req_ids
+    attn_metadata = plan.attn_metadata
+
+    # --- Phase 1: detect steering requests at this layer ------------
+    per_req_steering = plan.steering
+    needs_steering = any(
+        layer_idx in cfg.layer_index_map
+        for configs in per_req_steering
+        for cfg in configs
+    )
 
     # --- Phase 2: apply steering ------------------------------------
     modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None = None
@@ -439,10 +541,9 @@ def _hook_inner(
         seq_lens: Any = getattr(attn_metadata, "seq_lens", None)
 
         for i in range(num_reqs):
-            if not per_req_steering[i]:
+            if not any(layer_idx in cfg.layer_index_map for cfg in per_req_steering[i]):
                 continue
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
+            start, end = plan.span(i)
             n_query = end - start
             # Absolute position of the first token in this forward pass
             if seq_lens is not None:
@@ -464,28 +565,14 @@ def _hook_inner(
     # returned result index ("0", "1", ...) is stable regardless of how
     # many pre/post hooks a request mixes.  Pre-hooks are handled in
     # _pre_hook_inner using the same position keys.
-    per_req_hooks: list[list[Hook]] = []
-    needs_hooks = False
+    per_req_hooks = plan.hooks
     persistent_hooks = extension._persistent_hooks
     # Check eligibility before cloning or synchronizing CUDA request boundaries.
     persistent_active = any(
         not hook.pre and hook.has_layer(layer_idx) for hook in persistent_hooks
     )
-    per_req_active: list[bool] = []
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
-        )
-        hooks = _find_hook_configs_no_persistent(extension, req_id, extra)
-        per_req_hooks.append(hooks)
-        active = any(not hook.pre and hook.has_layer(layer_idx) for hook in hooks)
-        per_req_active.append(active)
-        if active or persistent_active:
-            needs_hooks = True
+    per_req_active = [layer_idx in layers for layers in plan.post_layers]
+    needs_hooks = persistent_active or any(per_req_active)
 
     if needs_hooks:
         # Compute hidden_states (summed if tuple) same as Phase 3 does.
@@ -534,8 +621,7 @@ def _hook_inner(
             if not (persistent_active or per_req_active[i]):
                 continue
             req_id = req_ids[i]
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
+            start, end = plan.span(i)
             # Persistent hooks fire first (base layer); per-request hooks
             # see the persistent-modified state.
             _run_post_category(
@@ -562,31 +648,13 @@ def _hook_inner(
             hidden_states = capture_src
 
         for i in range(num_reqs):
-            req_id = req_ids[i]
-            req_state = runner.requests.get(req_id)
-            if req_state is None or req_state.sampling_params is None:
-                continue
-            extra = req_state.sampling_params.extra_args
-            if not extra:
-                continue
-
-            output_residual_stream = extra.get("output_residual_stream")
-            if output_residual_stream is None:
-                continue
-            # vllm_xargs passes values as strings; parse JSON lists.
-            if isinstance(output_residual_stream, str):
-                try:
-                    output_residual_stream = json.loads(output_residual_stream)
-                except (json.JSONDecodeError, ValueError):
-                    pass  # treat as truthy (capture all layers)
-            if (
-                isinstance(output_residual_stream, list)
-                and layer_idx not in output_residual_stream
+            layers = plan.capture[i]
+            if layers is None or (
+                isinstance(layers, frozenset) and layer_idx not in layers
             ):
                 continue
-
-            start = query_start_loc[i].item()
-            end = query_start_loc[i + 1].item()
+            req_id = req_ids[i]
+            start, end = plan.span(i)
             activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
                 start:end
             ].cpu()
@@ -611,30 +679,11 @@ def _pre_hook_inner(
     Only runs generic hooks — steering and activation capture are
     post-hook operations and are not affected.
     """
-    if not is_forward_context_available():
+    plan = _get_step_plan(extension)
+    if plan is None:
         return None
 
     runner = extension.model_runner
-    num_reqs = runner.input_batch.num_reqs
-    if num_reqs == 0:
-        return None
-
-    req_ids = runner.input_batch.req_ids
-    ctx = get_forward_context()
-    attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    query_start_loc: torch.Tensor | None = None
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            break
-    if query_start_loc is None:
-        return None
 
     # Pre-hooks share the same context stores as post-hooks, keyed by the
     # hook's position in its category list.  A hook at a given position is
@@ -677,22 +726,12 @@ def _pre_hook_inner(
                     modified = True
                 working[start:end] = result
 
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
-        )
-        per_req = _find_hook_configs_no_persistent(extension, req_id, extra)
-        if not persistent_active and not any(
-            hook.pre and hook.has_layer(layer_idx) for hook in per_req
-        ):
+    for i, req_id in enumerate(plan.req_ids):
+        if not persistent_active and layer_idx not in plan.pre_layers[i]:
             continue
 
-        start = int(query_start_loc[i].item())
-        end = int(query_start_loc[i + 1].item())
+        per_req = plan.hooks[i]
+        start, end = plan.span(i)
         _run_pre_category(
             persistent_hooks, extension._persistent_hook_contexts, req_id, start, end
         )
@@ -961,6 +1000,9 @@ class HiddenStatesExtension:
 
     # Whether this rank should capture activations (only TP rank 0).
     _should_capture: bool = True
+
+    # Request lookups for the current forward pass (see _get_step_plan).
+    _step_plan: _StepPlan | None = None
 
     # Per-request captured attention Q/K (all TP ranks — heads are sharded):
     # internal_req_id → { layer_idx → {"q": [tensor, ...], "k": [tensor, ...]} }

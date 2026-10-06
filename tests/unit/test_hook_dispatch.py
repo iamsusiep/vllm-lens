@@ -23,25 +23,27 @@ def worker(monkeypatch):
     path = Path(__file__).resolve().parents[2] / "vllm_lens" / "_worker_ext.py"
     spec = importlib.util.spec_from_file_location("worker_hook_dispatch", path)
     module = importlib.util.module_from_spec(spec)
+    # dataclasses resolves annotations through sys.modules.
+    monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     return module
 
 
 class QueryStarts:
-    """Track scalar metadata reads that would synchronize a CUDA tensor."""
+    """Track metadata reads that would synchronize a CUDA tensor."""
 
-    def __init__(self, values, allowed=()):
+    def __init__(self, values, allowed=True):
         self.values = values
-        self.allowed = set(allowed)
-        self.reads = []
+        self.allowed = allowed
+        self.reads = 0
 
     def __getitem__(self, index):
-        def item():
-            assert index in self.allowed, f"Unexpected boundary read at {index}"
-            self.reads.append(index)
+        def tolist():
+            assert self.allowed, "Unexpected boundary read"
+            self.reads += 1
             return self.values[index]
 
-        return SimpleNamespace(item=item)
+        return SimpleNamespace(tolist=tolist)
 
 
 def make_extension(worker, monkeypatch, starts, *, persistent=(), per_request=((),)):
@@ -55,13 +57,11 @@ def make_extension(worker, monkeypatch, starts, *, persistent=(), per_request=((
         requests=requests,
         model=object(),
     )
-    monkeypatch.setattr(
-        worker,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            attn_metadata={"attention": SimpleNamespace(query_start_loc=starts)}
-        ),
+    # vLLM keeps one forward context for every layer of a forward pass.
+    forward_context = SimpleNamespace(
+        attn_metadata={"attention": SimpleNamespace(query_start_loc=starts)}
     )
+    monkeypatch.setattr(worker, "get_forward_context", lambda: forward_context)
     return SimpleNamespace(
         model_runner=runner,
         _persistent_hooks=list(persistent),
@@ -87,7 +87,7 @@ def test_ineligible_hooks_do_not_clone_or_read_boundaries(
         layer_indices=[hook_layer],
         pre=hook_pre,
     )
-    starts = QueryStarts([0, 2])
+    starts = QueryStarts([0, 2], allowed=False)
     extension = make_extension(
         worker,
         monkeypatch,
@@ -101,7 +101,7 @@ def test_ineligible_hooks_do_not_clone_or_read_boundaries(
     )
     dispatch = worker._pre_hook_inner if pre else worker._hook_inner
     assert dispatch(extension, 3, hidden) is None
-    assert starts.reads == []
+    assert starts.reads == 0
     assert extension._hook_contexts == extension._persistent_hook_contexts == {}
 
 
@@ -116,7 +116,7 @@ def test_only_eligible_request_reads_boundaries(worker, monkeypatch, pre):
             pre=not pre,
         ),
     ]
-    starts = QueryStarts([0, 2, 3, 6], allowed=[1, 2])
+    starts = QueryStarts([0, 2, 3, 6])
     extension = make_extension(
         worker, monkeypatch, starts, per_request=[[hook] for hook in hooks]
     )
@@ -127,7 +127,7 @@ def test_only_eligible_request_reads_boundaries(worker, monkeypatch, pre):
     result = dispatch(extension, 3, hidden)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(hidden, torch.arange(6).reshape(6, 1).float())
-    assert starts.reads == [1, 2]
+    assert starts.reads == 1
     assert set(extension._hook_contexts) == {"r1-internal"}
     assert extension._hook_contexts["r1-internal"][0].seq_len == 1
 
@@ -151,7 +151,7 @@ def test_mixed_hooks_keep_indices_and_compose_in_category_order(
             Hook(fn=fn, layer_indices=[3]),
         ]
 
-    starts = QueryStarts([0, 2], allowed=[0, 1])
+    starts = QueryStarts([0, 2])
     extension = make_extension(
         worker,
         monkeypatch,
@@ -180,7 +180,7 @@ def test_mixed_hooks_keep_indices_and_compose_in_category_order(
 @pytest.mark.parametrize("steering", [False, True])
 def test_inactive_hooks_preserve_capture_and_steering(worker, monkeypatch, steering):
     hook = Hook(fn=lambda *_: pytest.fail("Wrong layer"), layer_indices=[4])
-    starts = QueryStarts([0, 2], allowed=[0, 1])
+    starts = QueryStarts([0, 2])
     extension = make_extension(worker, monkeypatch, starts, persistent=[hook])
     req_id = "r0-internal"
     extension.model_runner.requests[req_id].sampling_params.extra_args = {
@@ -200,3 +200,82 @@ def test_inactive_hooks_preserve_capture_and_steering(worker, monkeypatch, steer
     else:
         assert result is None
     assert extension._persistent_hook_contexts == {}
+
+
+def test_one_plan_and_boundary_read_per_forward_pass(worker, monkeypatch):
+    seen = []
+    hooks = [
+        Hook(
+            fn=lambda ctx, h: seen.append(("pre", ctx.layer_idx)),
+            layer_indices=[0, 1],
+            pre=True,
+        ),
+        Hook(
+            fn=lambda ctx, h: seen.append(("post", ctx.layer_idx)), layer_indices=[0, 1]
+        ),
+    ]
+    starts = QueryStarts([0, 2, 3])
+    extension = make_extension(worker, monkeypatch, starts, per_request=[hooks, []])
+    extension.model_runner.requests["r1-internal"].sampling_params.extra_args = {
+        "output_residual_stream": "[1]"
+    }
+    lookups = []
+    find = worker._find_hook_configs_no_persistent
+    monkeypatch.setattr(
+        worker,
+        "_find_hook_configs_no_persistent",
+        lambda ext, req_id, extra: lookups.append(req_id) or find(ext, req_id, extra),
+    )
+    hidden = torch.arange(3, dtype=torch.float32).reshape(3, 1)
+    for layer in range(4):
+        worker._pre_hook_inner(extension, layer, hidden)
+        worker._hook_inner(extension, layer, hidden)
+
+    assert lookups == ["r0-internal", "r1-internal"]
+    assert starts.reads == 1
+    assert seen == [("pre", 0), ("post", 0), ("pre", 1), ("post", 1)]
+    assert list(extension._captured_states) == ["r1-internal"]
+    torch.testing.assert_close(
+        extension._captured_states["r1-internal"][1][0], hidden[2:]
+    )
+
+
+def test_new_forward_pass_rebuilds_plan(worker, monkeypatch):
+    starts = QueryStarts([0, 2])
+    extension = make_extension(worker, monkeypatch, starts)
+    hidden = torch.ones(2, 1)
+    assert worker._hook_inner(extension, 0, hidden) is None
+    # Registrations change between scheduler steps, with a new forward context.
+    extension._hook_data["r0"] = [Hook(fn=lambda _, h: h * 3, layer_indices=[0])]
+    next_context = SimpleNamespace(
+        attn_metadata={"attention": SimpleNamespace(query_start_loc=starts)}
+    )
+    monkeypatch.setattr(worker, "get_forward_context", lambda: next_context)
+    torch.testing.assert_close(worker._hook_inner(extension, 0, hidden), hidden * 3)
+
+
+def test_steering_for_other_layers_skips_clone_and_boundaries(worker, monkeypatch):
+    starts = QueryStarts([0, 2], allowed=False)
+    extension = make_extension(worker, monkeypatch, starts)
+    extension._steering_data["r0"] = [
+        SteeringVector(activations=torch.ones(1, 2), layer_indices=[5])
+    ]
+    monkeypatch.setattr(
+        torch.Tensor, "clone", lambda *_: pytest.fail("Inactive steering cloned")
+    )
+    assert worker._hook_inner(extension, 3, torch.ones(2, 2)) is None
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        ([1, 2], frozenset({1, 2})),
+        ("[1, 2]", frozenset({1, 2})),
+        (True, True),
+        ("not json", True),
+    ],
+)
+def test_capture_layers_parsing(worker, value, expected):
+    extra = {} if value is None else {"output_residual_stream": value}
+    assert worker._capture_layers(extra) == expected
